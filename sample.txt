@@ -1,0 +1,42 @@
+term plus assoc(left) prec(1);  // +
+term minus assoc(left) prec(1);  // -
+term mul assoc(left) prec(2);  // *
+term div assoc(left) prec(2);  // /
+term lp;  // (
+term rp;  // )
+term id {% Tokenizer::Token %};
+term number {% Tokenizer::Token %};
+
+nonterm Expression {% Ast::ExpressionPtr %};
+nonterm BinaryExp {% Ast::BinaryExpPtr %};
+nonterm UnaryExp {% Ast::UnaryExpPtr %};
+nonterm BinaryOp {% Ast::BinaryOp %};
+
+grammar {
+    // entry rules
+    Expression -> BinaryExp(org) {%
+        return std::static_pointer_cast<Ast::Expression>(org);
+    %};
+    Expression -> UnaryExp(rhs) {%
+        return std::static_pointer_cast<Ast::Expression>(rhs);
+    %};
+    Expression -> id(token) {%
+        return std::static_pointer_cast<Ast::Expression>(std::make_shared<Ast::ValueRef>(std::get<std::string>(token)));
+    %};
+    Expression -> number(token) {%
+        return std::static_pointer_cast<Ast::Expression>(std::make_shared<Ast::NumberLiteral>(std::get<double>(token)));
+    %};
+    Expression -> lp Expression(exp) rp {% return exp; %};
+
+    BinaryOp -> plus {% return Ast::BinaryOp::Plus; %};
+    BinaryOp -> minus {% return Ast::BinaryOp::Minus; %};
+    BinaryOp -> mul {% return Ast::BinaryOp::Multiply; %};
+    BinaryOp -> div {% return Ast::BinaryOp::Division; %};
+
+    BinaryExp -> Expression(lhs) BinaryOp(op) Expression(rhs) {%
+        return std::make_shared<Ast::BinaryExp>(lhs, rhs, op);
+    %};
+    UnaryExp -> minus Expression(rhs) prec(10) {%
+        return std::make_shared<Ast::UnaryExp>(rhs, Ast::UnaryOp::Negative);
+    %};
+};

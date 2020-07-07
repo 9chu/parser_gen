@@ -152,13 +152,14 @@ class Production:
     由一系列符号构成。
     """
     def __init__(self, left: Symbol, right: List[Symbol], binding: Dict[int, str], replace: Optional[str] = None,
-                 prec: int = 0, line: int = 0):
+                 prec: int = 0, line: int = -1, index: int = -1):
         self._left = left
         self._right = right
         self._binding = binding
         self._replace = replace
         self._prec = prec
         self._line = line
+        self._index = index
 
     def __repr__(self):
         if self._prec != 0:
@@ -195,21 +196,21 @@ class Production:
 
     def left(self) -> Symbol:
         """
-        获取产生式对应的非终结符。
+        获取产生式对应的非终结符
         :return: 非终结符
         """
         return self._left
 
     def binding(self) -> Dict[int, str]:
         """
-        获取绑定参数名的映射情况。
+        获取绑定参数名的映射情况
         :return: 绑定参数映射表
         """
         return self._binding
 
     def replace(self) -> Optional[str]:
         """
-        获取产生式对应的替代文本。
+        获取产生式对应的替代文本
         :return: 替代文本
         """
         return self._replace
@@ -227,6 +228,13 @@ class Production:
         :return: 行号
         """
         return self._line
+
+    def index(self) -> int:
+        """
+        获取产生式在源码中的索引
+        :return: 索引
+        """
+        return self._index
 
 
 class ParseError(Exception):
@@ -537,6 +545,8 @@ class GrammarDocument:
                         token, prec, line = GrammarDocument._advance(reader)
                         if token != TOKEN_INTEGER:
                             raise ParseError("Integer expected parsing precedence", line)
+                        if prec == 0:
+                            raise ParseError("Precedence must large than zero", line)
                         token, _, line = GrammarDocument._advance(reader)
                         if token != TOKEN_END_ARG:
                             raise ParseError("')' expected parsing associate type", line)
@@ -548,6 +558,8 @@ class GrammarDocument:
                     token, _, line = GrammarDocument._advance(reader)
                 if token != TOKEN_EOD:
                     raise ParseError("End of definition required", line)
+                if (assoc is not None) and (prec is None):
+                    raise ParseError("Precedence must be defined while associativity defined", def_line)
                 symbols[identifier] = Symbol(SYMBOL_TERMINAL, identifier, replace,
                                              ASSOC_UNDEF if assoc is None else assoc,
                                              0 if prec is None else prec,
@@ -619,6 +631,8 @@ class GrammarDocument:
                             token, prec, line = GrammarDocument._advance(reader)
                             if token != TOKEN_INTEGER:
                                 raise ParseError("Integer expected parsing precedence", line)
+                            if prec == 0:
+                                raise ParseError("Precedence must large than zero", line)
                             token, _, line = GrammarDocument._advance(reader)
                             if token != TOKEN_END_ARG:
                                 raise ParseError("')' required parsing precedence", line)
@@ -650,7 +664,7 @@ class GrammarDocument:
                                 prec = e.precedence()
                         if prec is None:
                             prec = 0
-                    production = Production(symbols[identifier], right, binding, replace, prec, def_line)
+                    production = Production(symbols[identifier], right, binding, replace, prec, def_line, len(productions))
                     if production in production_set:
                         raise ParseError(f"Production \"{production}\" redefined", def_line)
                     if (production.left().replace() is not None) and (production.replace() is None):
@@ -703,15 +717,15 @@ class ExtendProduction:
 
     增加当前位置和向前看符号来计算闭包。
     """
-    def __init__(self, raw: Production, index: int, lookahead: Set[Symbol]):
-        assert len(raw) >= index
+    def __init__(self, raw: Production, pos: int, lookahead: Set[Symbol]):
+        assert len(raw) >= pos
         self._production = raw
-        self._index = index
+        self._pos = pos
         self._lookahead = lookahead
 
     def __repr__(self):
         right = [repr(x) for x in self._production]
-        right.insert(self._index, "·")
+        right.insert(self._pos, "·")
         return "(%s -> %s, %s)" % (repr(self._production.left()), " ".join(right), self._lookahead)
 
     def __len__(self):
@@ -724,7 +738,7 @@ class ExtendProduction:
     def __eq__(self, obj) -> bool:
         if not isinstance(obj, ExtendProduction):
             return False
-        if self._index != obj._index:
+        if self._pos != obj._pos:
             return False
         if self._production != obj._production:
             return False
@@ -736,7 +750,7 @@ class ExtendProduction:
         return not self == obj
 
     def __hash__(self) -> int:
-        ret = hash(self._index)
+        ret = hash(self._pos)
         for x in self._lookahead:
             ret = ret ^ hash(x)
         ret = ret ^ hash(self._production)
@@ -749,12 +763,12 @@ class ExtendProduction:
         """
         return self._production
 
-    def index(self) -> int:
+    def pos(self) -> int:
         """
         获取当前分析位置
         :return: 位置
         """
-        return self._index
+        return self._pos
 
     def lookahead(self) -> Set[Symbol]:
         """
@@ -772,13 +786,10 @@ class ExtendProductionSet:
         self._set = s
         self._state = state_id
 
-    def __repr__(self):
-        return repr(self._set)
-
     def __len__(self):
         return len(self._set)
 
-    def __eq__(self, obj) -> bool:
+    def __eq__(self, obj) -> bool:  # state_id不参与比较
         if not isinstance(obj, ExtendProductionSet):
             return False
         return self._set == obj._set
@@ -808,6 +819,12 @@ class ExtendProductionSet:
         :return: 状态ID
         """
         return self._state
+
+    def set_state(self, state):
+        """
+        设置状态ID
+        """
+        self._state = state
 
     def add(self, x: ExtendProduction):
         """
@@ -844,11 +861,33 @@ class Action:
     """
     语法动作
     """
-    def __init__(self, action: int, arg, ref_state: ExtendProductionSet, ref_prod: ExtendProduction):
+    def __init__(self, action: int, arg, ref_state: ExtendProductionSet, ref_symbol: Symbol, ref_prod: Optional[ExtendProduction]):
         self._action = action
         self._arg = arg
         self._ref_state = ref_state
+        self._ref_symbol = ref_symbol
         self._ref_prod = ref_prod
+
+        # 参数检查
+        if action == ACTION_GOTO:
+            assert isinstance(arg, ExtendProductionSet)
+        elif action == ACTION_REDUCE:
+            assert isinstance(arg, Production)
+            assert arg.index() >= 0
+
+    def __repr__(self):
+        if self._action == ACTION_ACCEPT:
+            return "a"
+        elif self._action == ACTION_GOTO:
+            assert isinstance(self._arg, ExtendProductionSet)
+            if self._ref_symbol.type() == SYMBOL_NON_TERMINAL:
+                return f"g{self._arg.state()}"
+            else:
+                return f"s{self._arg.state()}"
+        elif self._action == ACTION_REDUCE:
+            assert isinstance(self._arg, Production)
+            return f"r{self._arg.index()}"
+        return ""
 
     def action(self) -> int:
         """
@@ -871,16 +910,37 @@ class Action:
         """
         return self._ref_state
 
-    def ref_prod(self) -> ExtendProduction:
+    def ref_symbol(self) -> Symbol:
+        """
+        获取关联的符号
+        :return: 符号
+        """
+        return self._ref_symbol
+
+    def ref_prod(self) -> Optional[ExtendProduction]:
         """
         获取关联的生成式
+
+        对于Shift操作不存在关联的生成式。
         :return: 项
         """
         return self._ref_prod
 
 
-# GRAMMAR_MODE_LR1 = 0
-# GRAMMAR_MODE_LALR = 1
+class GrammarError(Exception):
+    """
+    解析错误
+    """
+    def __init__(self, message: str):
+        Exception.__init__(self, message)
+        self._message = message
+
+    def message(self):
+        return self._message
+
+
+GRAMMAR_MODE_LR1 = 0
+GRAMMAR_MODE_LALR = 1
 
 
 class GrammarGenerator:
@@ -899,8 +959,11 @@ class GrammarGenerator:
         self._extend_symbols.add(kEofSymbol)
 
         # 初始化分析动作表
-        self._actions = {}  # type: Dict[Symbol, Dict[int, Tuple[int, Optional[int]]]]
+        self._actions = {}  # type: Dict[Symbol, Dict[int, Action]]
         self._max_state = 0  # 最大的状态ID
+        self._resolve_rr_conflict = 0  # 解决Reduce/Reduce冲突的次数
+        self._resolve_sr_conflict_by_prec = 0  # 解决Reduce/Shift冲突的次数（通过算符优先）
+        self._resolve_sr_conflict_by_shift = 0  # 解决Reduce/Shift冲突的次数（通过Shift优先）
         self._reset_actions()
 
     def _analyze_nullable_first_follow_set(self):
@@ -1018,64 +1081,25 @@ class GrammarGenerator:
         for s in self._extend_symbols:
             self._actions[s] = {}
         self._max_state = 0
+        self._resolve_rr_conflict = 0
+        self._resolve_sr_conflict_by_prec = 0
+        self._resolve_sr_conflict_by_shift = 0
 
-    def _resolve_conflict(self) -> bool:
-        pass  # TODO
-
-    def _populate_action(self, s: Symbol, state: int, act: Tuple[int, Optional[int]]):
-        if state in self._actions[s]:
-            if self._actions[s][state][0] == ACTION_GOTO:
-                left = "shift"
-            elif self._actions[s][state][0] == ACTION_REDUCE:
-                left = "reduce"
-            elif self._actions[s][state][0] == ACTION_ACCEPT:
-                left = "accept"
-            else:
-                assert False
-            if act[0] == ACTION_GOTO:
-                right = "shift"
-            elif act[0] == ACTION_REDUCE:
-                right = "reduce"
-            elif act[0] == ACTION_ACCEPT:
-                right = "accept"
-            else:
-                assert False
-            raise RuntimeError(f"{left}/{right} conflict, symbol {s}, state {state}, action {act}")
-        self._actions[s][state] = act
-
-    def _format_actions(self):
-        ret = []
-        header = self._actions.keys()
-        ret.append("|" + "|".join([x.id() for x in header]))
-        for state in range(0, self._max_state + 1):
-            line = [str(state)]
-            for k in header:
-                if state in self._actions[k]:
-                    action = self._actions[k][state][0]
-                    arg = self._actions[k][state][1]
-                    if action == ACTION_REDUCE:
-                        line.append(f"r{arg}")
-                    elif action == ACTION_ACCEPT:
-                        line.append("a")
-                    elif action == ACTION_GOTO:
-                        if k.type() == SYMBOL_NON_TERMINAL:
-                            line.append(f"g{arg}")
-                        else:
-                            line.append(f"s{arg}")
-                else:
-                    line.append("")
-            ret.append("|".join(line))
-        return "\n".join(ret)
-
-    def _closure(self, org: ExtendProductionSet):
+    def _closure(self, org: ExtendProductionSet) -> ExtendProductionSet:
+        """
+        求项集的闭包
+        :param org: 原始项集
+        :return: 项集的闭包
+        """
         ret = org.clone()  # copy
+        ret.set_state(-1)  # 需要外部重新赋予状态ID
         add = set()
         while True:
             for e in ret:
-                if e.index() >= len(e.production()):
+                if e.pos() >= len(e.production()):
                     continue
 
-                x = e.production()[e.index()]
+                x = e.production()[e.pos()]
                 if x.type() == SYMBOL_TERMINAL:
                     continue
                 if x.type() == SYMBOL_EOF:
@@ -1083,12 +1107,12 @@ class GrammarGenerator:
                     continue
                 assert(x.type() != SYMBOL_ENTRY)
 
-                # 计算FIRST集
+                # 计算 FIRST 集
                 first = set()
-                for i in range(e.index() + 1, len(e.production()) + 1):
+                for i in range(e.pos() + 1, len(e.production()) + 1):
                     # 若 p[cur+1..i] 都可空，那么 first[X] = first[X] ∪ first[p[i]]
                     prefix_nullable = True
-                    for j in range(e.index() + 1, i):
+                    for j in range(e.pos() + 1, i):
                         if not self._nullable_set[e.production()[j]]:
                             prefix_nullable = False
                             break
@@ -1114,62 +1138,215 @@ class GrammarGenerator:
             add.clear()
         return ret
 
-    def _goto(self, org: ExtendProductionSet, x: Symbol):
+    def _goto(self, org: ExtendProductionSet, x: Symbol) -> ExtendProductionSet:
+        """
+        求项集在符号 X 下可以转移到的状态
+        :param org: 原始项集
+        :param x: 转移符号
+        :return: 输出状态
+        """
         ret = set()
         for e in org:
-            if e.index() >= len(e.production()):
+            if e.pos() >= len(e.production()):
                 continue
-            s = e.production()[e.index()]
+            s = e.production()[e.pos()]
             if s != x:
                 continue
-            p = ExtendProduction(e.production(), e.index() + 1, e.lookahead())
+            p = ExtendProduction(e.production(), e.pos() + 1, e.lookahead())
             if p not in ret:
                 ret.add(p)
-        return self._closure(ExtendProductionSet(ret))
+        return self._closure(ExtendProductionSet(ret, -1))  # 需要外部重新赋予状态ID
 
-    def process(self):
+    def _populate_action(self, s: Symbol, state: int, act: Action):
+        if state in self._actions[s]:
+            org_action = self._actions[s][state]
+
+            # 如果存在Shift/Shift冲突，则抛出错误
+            if org_action.action() == ACTION_GOTO and act.action() == ACTION_GOTO:
+                raise GrammarError(f"Shift/shift conflict detected, symbol {repr(s)}, state: {repr(org_action.ref_state())}, goto state 1: "
+                                   f"{repr(org_action.arg())}, goto state 2: {repr(act.arg())}")
+
+            # 针对Reduce/Reduce的情况，选择优先出现的规则
+            elif org_action.action() == ACTION_REDUCE and act.action() == ACTION_REDUCE:
+                assert isinstance(org_action.arg(), Production)
+                assert isinstance(act.arg(), Production)
+                assert org_action.arg().index() != act.arg().index()
+                self._resolve_rr_conflict += 1
+                if org_action.arg().index() < act.arg().index():
+                    return
+
+            # 针对Reduce/Shift的情况
+            elif (org_action.action() == ACTION_REDUCE and act.action() == ACTION_GOTO) or \
+                    (org_action.action() == ACTION_GOTO and act.action() == ACTION_REDUCE):
+                reduce_action = org_action if org_action.action() == ACTION_REDUCE else act
+                shift_action = act if reduce_action == org_action else org_action
+                reduce_production = reduce_action.arg()  # type: Production
+                assert isinstance(reduce_production, Production)
+                assert isinstance(shift_action.arg(), ExtendProductionSet)
+                assert shift_action.ref_symbol() == s
+
+                accept_reduce = None
+
+                # 首先尝试算符优先
+                # 语法规则保证定义了结合性时必然定义了算符优先级，对于没有定义算符优先级的表达式/符号不会通过算符优先方式解决
+                if reduce_production.precedence() != 0 and s.precedence() != 0:
+                    # 如果优先级一致，则考虑结合性
+                    if reduce_production.precedence() == s.precedence():
+                        # 找到Reduce产生式的符号获取结合性
+                        reduce_symbol = None
+                        for i in range(len(reduce_production) - 1, -1, -1):
+                            if reduce_production[i].type() == SYMBOL_NON_TERMINAL:
+                                reduce_symbol = reduce_production[i]
+                                break
+                        assert reduce_symbol is not None
+
+                        # 如果结合性不一致，或者没有定义结合性，则抛出错误
+                        assert isinstance(reduce_symbol, Symbol)
+                        if reduce_symbol.associativity() == ASSOC_NONE or s.associativity() == ASSOC_NONE:
+                            raise GrammarError(f"Shift/reduce conflict detected, symbol {repr(s)}, state: {repr(org_action.ref_state())}, "
+                                               f"production: {repr(reduce_action.arg())}")
+                        if reduce_symbol.associativity() != ASSOC_UNDEF and s.associativity() != ASSOC_UNDEF and \
+                                reduce_symbol.associativity() != s.associativity():
+                            raise GrammarError(f"Shift/reduce conflict detected, symbol {repr(s)}, state: {repr(org_action.ref_state())}, "
+                                               f"production: {repr(reduce_action.arg())}")
+
+                        # 如果为左结合，则采取Reduce操作，否则采取Shift操作
+                        if s.associativity() == ASSOC_LEFT:
+                            assert reduce_symbol.associativity() == ASSOC_LEFT
+                            accept_reduce = True
+                        else:
+                            assert s.associativity() == ASSOC_RIGHT
+                            assert reduce_symbol.associativity() == ASSOC_RIGHT
+                            accept_reduce = False
+                        self._resolve_sr_conflict_by_prec += 1
+                    else:  # 优先级不一致，选择优先级高的进行reduce/shift
+                        if reduce_production.precedence() > s.precedence():
+                            accept_reduce = True
+                        else:
+                            accept_reduce = False
+                else:  # 此时优先使用Shift
+                    accept_reduce = False
+                    self._resolve_sr_conflict_by_shift += 1
+
+                # 最终决定是否接受覆盖
+                assert accept_reduce is not None
+                if accept_reduce and reduce_action == org_action:
+                    return
+                if not accept_reduce and reduce_action == act:
+                    return
+
+            # 不会有其他情况了
+            else:
+                assert False
+        self._actions[s][state] = act  # 覆盖状态
+
+    def _process_lr1(self):
         # 以首个规则作为入口
-        entry_rule = ExtendProduction(Production(kEntrySymbol, [self._doc.productions()[0].left(), kEofSymbol], None),
-                                      0, set())
-        entry_rule_set = ExtendProductionSet({entry_rule})
-        entry_rule_closure = self._closure(entry_rule_set)
+        entry_production = Production(kEntrySymbol, [self._doc.productions()[0].left(), kEofSymbol], {})
+        entry_production_ex = ExtendProduction(entry_production, 0, set())
+        entry_item_set = self._closure(ExtendProductionSet({entry_production_ex}, -1))
+        entry_item_set.set_state(0)  # 首个状态
 
         # 初始化状态
         next_state = 1
-        states = {entry_rule_closure: 0}  # type: Dict[ExtendProductionSet, int]
-        q = [entry_rule_closure]  # type: List[ExtendProductionSet]
+        states = {entry_item_set: entry_item_set.state()}  # type: Dict[ExtendProductionSet, int]
+        q = [entry_item_set]  # type: List[ExtendProductionSet]
 
         # 计算动作表
-        self._reset_actions()
         while len(q) > 0:
-            current = q.pop(0)
-            state = states[current]
+            state = q.pop(0)
+            assert states[state] == state.state()
 
             # 填写规约动作
-            for p in current:
-                if p.index() >= len(p.production()):
-                    p_index = self._doc.productions().index(p.production())
+            for p in state:
+                if p.pos() >= len(p.production()):
                     for x in p.lookahead():
-                        self._populate_action(x, state, (ACTION_REDUCE, p_index))
+                        action = Action(ACTION_REDUCE, p.production(), state, x, p)
+                        self._populate_action(x, state.state(), action)
 
             # 计算Shift/Goto/Accept
             for x in self._extend_symbols:
-                goto = self._goto(current, x)
+                goto = self._goto(state, x)
                 if len(goto) == 0:
                     continue
                 if x == kEofSymbol:
-                    self._populate_action(x, state, (ACTION_ACCEPT, None))
+                    for p in goto:
+                        if p.pos() >= len(p.production()):
+                            action = Action(ACTION_ACCEPT, None, state, x, p)
+                            self._populate_action(x, state.state(), action)
+                        else:
+                            assert False  # 经由Eof推导出的状态只能是Reduce，不可能出现其他情况
                 else:
                     if goto in states:
-                        goto_state = states[goto]
+                        goto.set_state(states[goto])
                     else:
-                        goto_state = next_state
+                        goto.set_state(next_state)
                         next_state += 1
-                        states[goto] = goto_state
+                        states[goto] = goto.state()
                         q.append(goto)
-                    self._populate_action(x, state, (ACTION_GOTO, goto_state))
+                    assert goto.state() != -1
+                    action = Action(ACTION_GOTO, goto, state, x, None)
+                    self._populate_action(x, state.state(), action)
         self._max_state = next_state - 1
-        print(self._format_actions())
+
+    def actions(self):
+        """
+        获取计算后的动作表
+        :return: 动作转换表
+        """
+        return self._actions
+
+    def printable_actions(self) -> str:
+        """
+        获取可打印动作表
+        :return: 字符串结果
+        """
+        ret = []
+        header = [None]  # 表头
+        for s in self._doc.terminals():
+            header.append(s)
+        header.append(kEofSymbol)
+        for s in self._doc.non_terminals():
+            header.append(s)
+        min_width = len(str(self._max_state)) + 1
+        header_width = [max(min_width, len(s.id()) if s is not None else 0) for s in header]
+
+        # 打印表头
+        ret.append(" | ".join([header[i].id().rjust(header_width[i]) if header[i] is not None else "".rjust(header_width[i])
+                               for i in range(0, len(header))]))
+
+        # 打印所有行
+        for s in range(0, self._max_state + 1):
+            empty = True
+            data = []
+            for i in range(0, len(header)):
+                if i == 0:
+                    data.append(str(s).rjust(header_width[i]))
+                else:
+                    if s in self._actions[header[i]]:
+                        data.append(repr(self._actions[header[i]][s]).rjust(header_width[i]))
+                        empty = False
+                    else:
+                        data.append("".rjust(header_width[i]))
+            if not empty:
+                ret.append(" | ".join(data))
+        return "\n".join(ret)
+
+    def process(self, mode):
+        """
+        处理语法
+        :param mode: 语法模式
+        """
+        self._reset_actions()
+        if mode == GRAMMAR_MODE_LR1:
+            self._process_lr1()
+        else:
+            assert mode == GRAMMAR_MODE_LALR
+            # TODO
+            raise NotImplementedError()
+
+    def resolve_stat(self) -> Tuple[int, int, int]:
+        return self._resolve_rr_conflict, self._resolve_sr_conflict_by_prec, self._resolve_sr_conflict_by_shift
 
 
 if __name__ == "__main__":
@@ -1179,4 +1356,7 @@ if __name__ == "__main__":
     print(doc.terminals())
     print(doc.non_terminals())
     analyzer = GrammarGenerator(doc)
-    analyzer.process()
+    analyzer.process(GRAMMAR_MODE_LR1)
+    print(analyzer.printable_actions())
+    resolve_rr_cnt, resolve_sr_by_prec_cnt, resolve_sr_by_shift_cnt = analyzer.resolve_stat()
+    print(f"Resolve RR: {resolve_rr_cnt}, Resolve SR: {resolve_sr_by_prec_cnt} / {resolve_sr_by_shift_cnt}")

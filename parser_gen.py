@@ -664,7 +664,8 @@ class GrammarDocument:
                                 prec = e.precedence()
                         if prec is None:
                             prec = 0
-                    production = Production(symbols[identifier], right, binding, replace, prec, def_line, len(productions))
+                    production = Production(symbols[identifier], right, binding, replace, prec, def_line,
+                                            len(productions))
                     if production in production_set:
                         raise ParseError(f"Production \"{production}\" redefined", def_line)
                     if (production.left().replace() is not None) and (production.replace() is None):
@@ -861,7 +862,8 @@ class Action:
     """
     语法动作
     """
-    def __init__(self, action: int, arg, ref_state: ExtendProductionSet, ref_symbol: Symbol, ref_prod: Optional[ExtendProduction]):
+    def __init__(self, action: int, arg, ref_state: ExtendProductionSet, ref_symbol: Symbol,
+                 ref_prod: Optional[ExtendProduction]):
         self._action = action
         self._arg = arg
         self._ref_state = ref_state
@@ -943,7 +945,7 @@ GRAMMAR_MODE_LR1 = 0
 GRAMMAR_MODE_LALR = 1
 
 
-class GrammarGenerator:
+class GrammarAnalyzer:
     def __init__(self, document: GrammarDocument):
         self._doc = document
 
@@ -1158,86 +1160,118 @@ class GrammarGenerator:
         return self._closure(ExtendProductionSet(ret, -1))  # 需要外部重新赋予状态ID
 
     def _populate_action(self, s: Symbol, state: int, act: Action):
-        if state in self._actions[s]:
+        if state in self._actions[s]:  # 冲突解决
+            raise_error = True
+            conflict_type = 0  # 0: unknown 1: shift/shift冲突 2:shift/reduce冲突 3:reduce/reduce冲突
+            conflict_args = ()
             org_action = self._actions[s][state]
+            assert state == org_action.ref_state().state()
 
             # 如果存在Shift/Shift冲突，则抛出错误
             if org_action.action() == ACTION_GOTO and act.action() == ACTION_GOTO:
-                raise GrammarError(f"Shift/shift conflict detected, symbol {repr(s)}, state: {repr(org_action.ref_state())}, goto state 1: "
-                                   f"{repr(org_action.arg())}, goto state 2: {repr(act.arg())}")
+                assert isinstance(org_action.arg(), ExtendProductionSet)
+                assert isinstance(act.arg(), ExtendProductionSet)
+                conflict_type = 1
+                conflict_args = (s, org_action.ref_state().state(), org_action.arg(), act.arg())
 
             # 针对Reduce/Reduce的情况，选择优先出现的规则
-            elif org_action.action() == ACTION_REDUCE and act.action() == ACTION_REDUCE:
+            if org_action.action() == ACTION_REDUCE and act.action() == ACTION_REDUCE:
                 assert isinstance(org_action.arg(), Production)
                 assert isinstance(act.arg(), Production)
                 assert org_action.arg().index() != act.arg().index()
+                conflict_type = 3
+                conflict_args = (s, org_action.ref_state().state(), org_action.arg(), act.arg())
+                raise_error = False
                 self._resolve_rr_conflict += 1
-                if org_action.arg().index() < act.arg().index():
-                    return
+                if act.arg().index() > org_action.arg().index():
+                    return  # 不接受在后面的产生式
 
             # 针对Reduce/Shift的情况
-            elif (org_action.action() == ACTION_REDUCE and act.action() == ACTION_GOTO) or \
+            if (org_action.action() == ACTION_REDUCE and act.action() == ACTION_GOTO) or \
                     (org_action.action() == ACTION_GOTO and act.action() == ACTION_REDUCE):
-                reduce_action = org_action if org_action.action() == ACTION_REDUCE else act
-                shift_action = act if reduce_action == org_action else org_action
+                if org_action.action() == ACTION_REDUCE:
+                    reduce_action = org_action
+                    shift_action = act
+                else:
+                    reduce_action = act
+                    shift_action = org_action
                 reduce_production = reduce_action.arg()  # type: Production
+                shift_state = shift_action.arg()  # type: ExtendProductionSet
                 assert isinstance(reduce_production, Production)
-                assert isinstance(shift_action.arg(), ExtendProductionSet)
+                assert isinstance(shift_state, ExtendProductionSet)
                 assert shift_action.ref_symbol() == s
+                assert s.type() != SYMBOL_NON_TERMINAL  # 非终结符不可能出现SR冲突
+                conflict_type = 2
+                conflict_args = (s, org_action.ref_state().state(), reduce_production)
 
                 accept_reduce = None
+                raise_error = False
 
                 # 首先尝试算符优先
                 # 语法规则保证定义了结合性时必然定义了算符优先级，对于没有定义算符优先级的表达式/符号不会通过算符优先方式解决
-                if reduce_production.precedence() != 0 and s.precedence() != 0:
+                if s.type() == SYMBOL_TERMINAL and s.precedence() > 0 and reduce_production.precedence() > 0:
                     # 如果优先级一致，则考虑结合性
-                    if reduce_production.precedence() == s.precedence():
+                    if s.precedence() == reduce_production.precedence():
                         # 找到Reduce产生式的符号获取结合性
                         reduce_symbol = None
                         for i in range(len(reduce_production) - 1, -1, -1):
-                            if reduce_production[i].type() == SYMBOL_NON_TERMINAL:
+                            if reduce_production[i].type() == SYMBOL_TERMINAL:
                                 reduce_symbol = reduce_production[i]
                                 break
                         assert reduce_symbol is not None
 
-                        # 如果结合性不一致，或者没有定义结合性，则抛出错误
-                        assert isinstance(reduce_symbol, Symbol)
                         if reduce_symbol.associativity() == ASSOC_NONE or s.associativity() == ASSOC_NONE:
-                            raise GrammarError(f"Shift/reduce conflict detected, symbol {repr(s)}, state: {repr(org_action.ref_state())}, "
-                                               f"production: {repr(reduce_action.arg())}")
-                        if reduce_symbol.associativity() != ASSOC_UNDEF and s.associativity() != ASSOC_UNDEF and \
-                                reduce_symbol.associativity() != s.associativity():
-                            raise GrammarError(f"Shift/reduce conflict detected, symbol {repr(s)}, state: {repr(org_action.ref_state())}, "
-                                               f"production: {repr(reduce_action.arg())}")
-
-                        # 如果为左结合，则采取Reduce操作，否则采取Shift操作
-                        if s.associativity() == ASSOC_LEFT:
-                            assert reduce_symbol.associativity() == ASSOC_LEFT
-                            accept_reduce = True
+                            # 没有结合性，报错
+                            raise_error = True
+                        elif reduce_symbol.associativity() == ASSOC_UNDEF or s.associativity() == ASSOC_UNDEF:
+                            # 未定义结合性，回退到Shift优先规则
+                            pass
+                        elif reduce_symbol.associativity() != s.associativity():
+                            # 结合性不一致，报错
+                            raise_error = True
                         else:
-                            assert s.associativity() == ASSOC_RIGHT
-                            assert reduce_symbol.associativity() == ASSOC_RIGHT
-                            accept_reduce = False
-                        self._resolve_sr_conflict_by_prec += 1
+                            # 结合性一致，按照结合性解决SR冲突
+                            assert reduce_symbol.associativity() == s.associativity()
+
+                            # 如果为左结合，则采取Reduce操作，否则采取Shift操作
+                            if s.associativity() == ASSOC_LEFT:
+                                accept_reduce = True
+                            else:
+                                assert s.associativity() == ASSOC_RIGHT
+                                accept_reduce = False
+                            self._resolve_sr_conflict_by_prec += 1
                     else:  # 优先级不一致，选择优先级高的进行reduce/shift
                         if reduce_production.precedence() > s.precedence():
                             accept_reduce = True
                         else:
                             accept_reduce = False
-                else:  # 此时优先使用Shift
+                        self._resolve_sr_conflict_by_prec += 1
+
+                # 在算符优先也没有解决的情况下，优先使用Shift规则
+                if (accept_reduce is None) and (not raise_error):
                     accept_reduce = False
                     self._resolve_sr_conflict_by_shift += 1
 
                 # 最终决定是否接受覆盖
-                assert accept_reduce is not None
-                if accept_reduce and reduce_action == org_action:
-                    return
-                if not accept_reduce and reduce_action == act:
-                    return
+                if accept_reduce is not None:
+                    assert not raise_error
+                    if accept_reduce and reduce_action == org_action:
+                        return
+                    elif not accept_reduce and reduce_action == act:
+                        return
 
-            # 不会有其他情况了
-            else:
-                assert False
+            assert conflict_type != 0
+            if raise_error:  # 未能解决冲突
+                if conflict_type == 1:
+                    raise GrammarError(f"Shift/shift conflict detected, symbol {repr(conflict_args[0])}, state: "
+                                       f"{repr(conflict_args[1])}, shift state 1: {repr(conflict_args[2])}, "
+                                       f"shift state 2: {repr(conflict_args[3])}")
+                elif conflict_type == 2:
+                    raise GrammarError(f"Shift/reduce conflict detected, state: {repr(conflict_args[1])}, "
+                                       f"shift symbol: {repr(conflict_args[0])}, reduce production: "
+                                       f"{repr(conflict_args[2])}")
+                elif conflict_type == 3:
+                    assert False  # Reduce/reduce冲突总能被解决
         self._actions[s][state] = act  # 覆盖状态
 
     def _process_lr1(self):
@@ -1312,8 +1346,8 @@ class GrammarGenerator:
         header_width = [max(min_width, len(s.id()) if s is not None else 0) for s in header]
 
         # 打印表头
-        ret.append(" | ".join([header[i].id().rjust(header_width[i]) if header[i] is not None else "".rjust(header_width[i])
-                               for i in range(0, len(header))]))
+        ret.append(" | ".join([header[i].id().rjust(header_width[i]) if header[i] is not None else
+                               "".rjust(header_width[i]) for i in range(0, len(header))]))
 
         # 打印所有行
         for s in range(0, self._max_state + 1):
@@ -1355,7 +1389,7 @@ if __name__ == "__main__":
     print(doc.productions())
     print(doc.terminals())
     print(doc.non_terminals())
-    analyzer = GrammarGenerator(doc)
+    analyzer = GrammarAnalyzer(doc)
     analyzer.process(GRAMMAR_MODE_LR1)
     print(analyzer.printable_actions())
     resolve_rr_cnt, resolve_sr_by_prec_cnt, resolve_sr_by_shift_cnt = analyzer.resolve_stat()

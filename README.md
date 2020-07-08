@@ -265,7 +265,7 @@ Run it:
     public:
         enum class ParseResult
         {
-            NotKnown = 0,
+            Undecided = 0,
             Accepted = 1,
             Rejected = 2,
         };

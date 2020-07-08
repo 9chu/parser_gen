@@ -1,12 +1,15 @@
 # parser_gen
 
-一个小巧的`LR(1)/LALR(1)`解析器生成工具，适用于`C++17`或更高。
+一个简单的`LR(1)/LALR(1)`解析器生成工具，适用于`C++17`或更高。
 
 Working in progress.
 
 ## TODO
 
+- [x] 完成LR(1)支持
+- [x] 冲突解决
 - [ ] 完成LALR支持
+- [ ] 人可读报错
 
 ## 快速开始
 
@@ -251,6 +254,80 @@ Run it:
   - 采取移进规则解决；
 - 下述规则被依次用于解决规约/规约冲突：
   - 依照生成式的定义顺序解决，先定义的生成式会先被用于解决冲突；
+
+## 生成代码接口
+
+生成器将会依据模板产生下述样式的入口：
+
+```c++
+    class Parser
+    {
+    public:
+        enum class ParseResult
+        {
+            NotKnown = 0,
+            Accepted = 1,
+            Rejected = 2,
+        };
+        
+        enum class TokenTypes
+        {
+            _ = 0,
+            Division = 1,
+            LeftParen = 2,
+            LiteralNumber = 3,
+            Minus = 4,
+            Multiply = 5,
+            Plus = 6,
+            RightParen = 7,
+        };
+        
+        using TokenValues = std::variant<std::monostate, int>;
+        using ProductionValues = std::variant<int>;
+        using UnionValues = std::variant<TokenValues, ProductionValues>;
+        
+    public:
+        Parser();
+        
+    public:
+        ParseResult operator()(TokenTypes token, const TokenValues& value);
+        void Reset()noexcept;
+        const int& Result()const noexcept { return m_stResult; }
+        int& Result()noexcept { return m_stResult; }
+        
+    private:
+        std::vector<uint32_t> m_stStack;
+        std::vector<UnionValues> m_stValueStack;
+        
+        int m_stResult {};
+    };
+```
+
+- Parser::TokenTypes
+
+    存放所有终结符的枚举表示，`Tokenizer`可以利用这里的`TokenTypes`向`Parser`传递下一个符号。
+
+- Parser::TokenValues
+
+    存放所有终结符的值表示，将会传递给用户定义的驱动函数使用。
+    
+- Parser::ProductionValues
+
+    存放所有非终结符的值表示，将会在计算过程中被使用。
+
+- Parser::operator()
+
+    通过解析器的`operator()`向解析器喂一个`Token`。如果解析失败，返回`Reject`；如果解析成功，返回`Accept`，并且`Parser::Result()`可以访问存储的解析结果。
+
+    若内部抛出异常，需要手动执行`Reset()`重置状态，否则行为是未定义的。
+
+- Parser::Reset()
+
+    重置状态。
+
+- Parser::Result()
+
+    获取解析结果，对应第一个产生式的非终结符类型。
 
 ## License
 

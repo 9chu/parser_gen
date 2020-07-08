@@ -1960,7 +1960,7 @@ namespace {% namespace %}
     public:
         enum class ParseResult
         {
-            NotKnown = 0,
+            Undecided = 0,
             Accepted = 1,
             Rejected = 2,
         };
@@ -1994,7 +1994,8 @@ namespace {% namespace %}
         void Reset()noexcept;
         
         {% if production_info[0]["raw"].left().replace() is not None %}
-        const {% production_info[0]["raw"].left().replace() %}& Result()noexcept { return m_stResult; }
+        const {% production_info[0]["raw"].left().replace() %}& Result()const noexcept { return m_stResult; }
+        {% production_info[0]["raw"].left().replace() %}& Result()noexcept { return m_stResult; }
         {% end %}
         
     private:
@@ -2002,7 +2003,7 @@ namespace {% namespace %}
         std::vector<UnionValues> m_stValueStack;
         
         {% if production_info[0]["raw"].left().replace() is not None %}
-        {% production_info[0]["raw"].left().replace() %} m_stResult;
+        {% production_info[0]["raw"].left().replace() %} m_stResult {};
         {% end %}
     };
 {% if namespace is None %}
@@ -2172,7 +2173,7 @@ static const ActionInfo kActions[{% len(actions) %}][{% len(symbols) %}] = {
         break;
     }
     
-    return ParseResult::NotKnown;
+    return ParseResult::Undecided;
 }
 
 void {% class_name %}::Reset()noexcept

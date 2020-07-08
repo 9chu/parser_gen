@@ -5,7 +5,11 @@
 # Author: chu
 # Email: 1871361697@qq.com
 # License: MIT License
+import os
+import sys
 import json
+import argparse
+import datetime
 from typing import List, Set, Dict, Tuple, Optional
 
 
@@ -1323,12 +1327,25 @@ class GrammarAnalyzer:
                     self._populate_action(x, state.state(), action)
         self._max_state = next_state - 1
 
+    def document(self):
+        """
+        获取原始语法文件
+        :return: 文档对象
+        """
+        return self._doc
+
     def actions(self):
         """
         获取计算后的动作表
         :return: 动作转换表
         """
         return self._actions
+
+    def max_state(self):
+        """
+        获取最大的状态ID
+        """
+        return self._max_state
 
     def printable_actions(self) -> str:
         """
@@ -1382,15 +1399,788 @@ class GrammarAnalyzer:
     def resolve_stat(self) -> Tuple[int, int, int]:
         return self._resolve_rr_conflict, self._resolve_sr_conflict_by_prec, self._resolve_sr_conflict_by_shift
 
+# ---------------------------------------- 模板渲染器 ----------------------------------------
+# 见 https://github.com/9chu/et-py
+
+
+class TemplateNode:
+    def __init__(self, parent):
+        self.parent = parent
+        self.nodes = []
+
+    def render(self, context):
+        pass
+
+
+class TemplateForNode(TemplateNode):
+    def __init__(self, parent, identifier, expression):
+        TemplateNode.__init__(self, parent)
+        self.identifier = identifier
+        self.expression = expression
+
+    def render(self, context):
+        result = eval(self.expression, None, context)
+        origin = context[self.identifier] if self.identifier in context else None
+        for i in result:
+            context[self.identifier] = i
+            yield iter(self.nodes)
+        if origin:
+            context[self.identifier] = origin
+
+
+class TemplateIfNode(TemplateNode):
+    def __init__(self, parent, expression):
+        TemplateNode.__init__(self, parent)
+        self.expression = expression
+        self.true_branch = self.nodes
+
+    def render(self, context):
+        test = eval(self.expression, None, context)
+        if test:
+            yield iter(self.true_branch)
+
+
+class TemplateIfElseNode(TemplateNode):
+    def __init__(self, parent, if_node):  # extent from IfNode
+        TemplateNode.__init__(self, parent)
+        self.expression = if_node.expression
+        self.true_branch = if_node.true_branch
+        self.false_branch = self.nodes
+
+    def render(self, context):
+        test = eval(self.expression, None, context)
+        if test:
+            yield iter(self.true_branch)
+        else:
+            yield iter(self.false_branch)
+
+
+class TemplateExpressionNode(TemplateNode):
+    def __init__(self, parent, expression):
+        TemplateNode.__init__(self, parent)
+        self.expression = expression
+
+    def render(self, context):
+        return eval(self.expression, None, context)
+
+
+class TextConsumer:
+    def __init__(self, text):
+        self._text = text
+        self._len = len(text)
+        self._pos = 0
+        self._line = 1
+        self._row = 0
+
+    def get_pos(self):
+        return self._pos
+
+    def get_line(self):
+        return self._line
+
+    def get_row(self):
+        return self._row
+
+    def read(self):
+        if self._pos >= self._len:
+            return '\0'
+        ch = self._text[self._pos]
+        self._pos += 1
+        self._row += 1
+        if ch == '\n':
+            self._line += 1
+            self._row = 0
+        return ch
+
+    def peek(self, advance=0):
+        if self._pos + advance >= self._len:
+            return '\0'
+        return self._text[self._pos + advance]
+
+    def substr(self, begin, end):
+        return self._text[begin:end]
+
+
+class TemplateParser:
+    OUTER_TOKEN_LITERAL = 1
+    OUTER_TOKEN_EXPRESS = 2
+
+    RESERVED = ["and", "as", "assert", "break", "class", "continue", "def", "del", "elif", "else", "except", "exec",
+                "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "not", "or", "pass", "print",
+                "raise", "return", "try", "while", "with", "yield"]
+
+    def __init__(self, text):
+        self._text = text
+        self._consumer = TextConsumer(text)
+
+    @staticmethod
+    def _is_starting_by_new_line(text):
+        for i in range(0, len(text)):
+            ch = text[i:i + 1]
+            if ch == '\n':
+                return True
+            elif not ch.isspace():
+                break
+        return False
+
+    @staticmethod
+    def _is_ending_by_new_line(text):
+        for i in range(len(text) - 1, -1, -1):
+            ch = text[i:i + 1]
+            if ch == '\n':
+                return True
+            elif not ch.isspace():
+                break
+        return False
+
+    @staticmethod
+    def _trim_left_until_new_line(text):
+        for i in range(0, len(text)):
+            ch = text[i:i+1]
+            if ch == '\n':
+                return text[i+1:]
+            elif not ch.isspace():
+                break
+        return text
+
+    @staticmethod
+    def _trim_right_until_new_line(text):
+        for i in range(len(text) - 1, -1, -1):
+            ch = text[i:i+1]
+            if ch == '\n':
+                return text[0:i+1]  # save right \n
+            elif not ch.isspace():
+                break
+        return text
+
+    @staticmethod
+    def _parse_blank(consumer):
+        while consumer.peek().isspace():  # 跳过所有空白
+            consumer.read()
+
+    @staticmethod
+    def _parse_identifier(consumer):
+        ch = consumer.peek()
+        if not (ch.isalpha() or ch == '_'):
+            return ""
+        chars = [consumer.read()]  # ch
+        ch = consumer.peek()
+        while ch.isalnum() or ch == '_':
+            chars.append(consumer.read())  # ch
+            ch = consumer.peek()
+        return "".join(chars)
+
+    @staticmethod
+    def _parse_inner(content, line, row):
+        """内层解析函数
+        考虑到表达式解析非常费力不讨好，这里采用偷懒方式进行。
+        表达式全部交由python自行解决，匹配仅匹配开头，此外不处理注释（意味着不能在表达式中包含注释内容）。
+        当满足 for <identifier> in <...> 时产生 for节点
+        当满足 if <...> 时产生 if节点
+        当满足 elif <...> 时产生 elif节点
+        当满足 else 时产生 else节点
+        当满足 end 时产生 end节点
+        :param content: 内层内容
+        :param line: 起始行
+        :param row: 起始列
+        :return: 节点名称, 表达式部分, 可选的Identifier
+        """
+        consumer = TextConsumer(content)
+        TemplateParser._parse_blank(consumer)
+        operator = TemplateParser._parse_identifier(consumer)
+        identifier = None
+        if operator == "for":
+            TemplateParser._parse_blank(consumer)
+            identifier = TemplateParser._parse_identifier(consumer)
+            if identifier == "" or (identifier in TemplateParser.RESERVED):
+                raise ParseError("Identifier expected", consumer.get_line() + line - 1,
+                                 consumer.get_row() + row if consumer.get_line() == 1 else consumer.get_row())
+            TemplateParser._parse_blank(consumer)
+            if TemplateParser._parse_identifier(consumer) != "in":
+                raise ParseError("Keyword 'in' expected", consumer.get_line() + line - 1,
+                                 consumer.get_row() + row if consumer.get_line() == 1 else consumer.get_row())
+            TemplateParser._parse_blank(consumer)
+            expression = content[consumer.get_pos():]
+            if expression == "":
+                raise ParseError("Expression expected", consumer.get_line() + line - 1,
+                                 consumer.get_row() + row if consumer.get_line() == 1 else consumer.get_row())
+        elif operator == "if" or operator == "elif":
+            TemplateParser._parse_blank(consumer)
+            expression = content[consumer.get_pos():]
+            if expression == "":
+                raise ParseError("Expression expected", consumer.get_line() + line - 1,
+                                 consumer.get_row() + row if consumer.get_line() == 1 else consumer.get_row())
+        elif operator == "end" or operator == "else":
+            TemplateParser._parse_blank(consumer)
+            expression = content[consumer.get_pos():]
+            if expression != '':
+                raise ParseError("Unexpected content", consumer.get_line() + line - 1,
+                                 consumer.get_row() + row if consumer.get_line() == 1 else consumer.get_row())
+        else:
+            operator = ""
+            expression = content
+        return operator, expression.strip(), identifier
+
+    def _parse_outer(self):
+        """外层解析函数
+        将输入拆分成字符串(Literal)和表达式(Expression)两个组成。
+        遇到'{%'开始解析Expression，在解析Expression时允许使用'%%'转义，即'%%'->'%'，这使得'%%>'->'%>'而不会结束表达式。
+        :return: 类型, 内容, 起始行, 起始列
+        """
+        begin = self._consumer.get_pos()
+        end = begin  # [begin, end)
+        begin_line = self._consumer.get_line()
+        begin_row = self._consumer.get_row()
+        ch = self._consumer.peek()
+        while ch != '\0':
+            if ch == '{':
+                ahead = self._consumer.peek(1)
+                if ahead == '%':
+                    if begin != end:
+                        return TemplateParser.OUTER_TOKEN_LITERAL, self._consumer.substr(begin, end), begin_line, \
+                               begin_row
+                    self._consumer.read()  # {
+                    self._consumer.read()  # %
+                    begin_line = self._consumer.get_line()
+                    begin_row = self._consumer.get_row()
+                    chars = []
+                    while True:
+                        ch = self._consumer.read()
+                        if ch == '\0':
+                            raise ParseError("Unexpected eof", self._consumer.get_line(), self._consumer.get_row())
+                        elif ch == '%':
+                            if self._consumer.peek() == '}':  # '%}'
+                                self._consumer.read()
+                                return TemplateParser.OUTER_TOKEN_EXPRESS, "".join(chars), begin_line, begin_row
+                            elif self._consumer.peek() == '%':  # '%%' -> '%'
+                                self._consumer.read()
+                        chars.append(ch)
+            self._consumer.read()
+            ch = self._consumer.peek()
+            end = self._consumer.get_pos()
+        return TemplateParser.OUTER_TOKEN_LITERAL, self._consumer.substr(begin, end), begin_line, begin_row
+
+    @staticmethod
+    def _trim_empty_line(result):
+        state = 0
+        left = None  # 需要剔除右边的元素
+        for i in range(0, len(result)):
+            cur = result[i]
+            p = result[i - 1] if i != 0 else None
+            n = result[i + 1] if i != len(result) - 1 else None
+            if state == 0:
+                # 当前是表达式，且上一个是文本
+                if cur[0] == TemplateParser.OUTER_TOKEN_EXPRESS:
+                    if p is None or (p[0] == TemplateParser.OUTER_TOKEN_LITERAL and
+                                     TemplateParser._is_ending_by_new_line(p[1])):
+                        left = i - 1 if p else None
+                        state = 1
+            if state == 1:
+                if n is None or (n[0] == TemplateParser.OUTER_TOKEN_LITERAL and
+                                 TemplateParser._is_starting_by_new_line(n[1])):
+                    right = i + 1 if n else None
+                    if left is not None:
+                        result[left] = (result[left][0],
+                                        TemplateParser._trim_right_until_new_line(result[left][1]),
+                                        result[left][2],
+                                        result[left][3])
+                    if right is not None:
+                        result[right] = (result[right][0],
+                                         TemplateParser._trim_left_until_new_line(result[right][1]),
+                                         result[right][2],
+                                         result[right][3])
+                    state = 0
+                elif cur[0] != TemplateParser.OUTER_TOKEN_EXPRESS:  # 行中有其他文本，不进行剔除
+                    state = 0
+
+    def process(self):
+        root = []  # 根
+        nodes = []  # 未闭合节点队列
+        outer_results = []
+        while True:  # 为了剔除空行，需要先解析完所有的根元素做预处理
+            ret = self._parse_outer()
+            if ret[0] == TemplateParser.OUTER_TOKEN_LITERAL and ret[1] == "":  # EOF
+                break
+            outer_results.append(ret)
+        TemplateParser._trim_empty_line(outer_results)
+        for i in outer_results:
+            (t, content, line, row) = i
+            back = None if len(nodes) == 0 else nodes[len(nodes) - 1]
+            if t == TemplateParser.OUTER_TOKEN_LITERAL:
+                root.append(content) if back is None else back.nodes.append(content)
+            else:
+                assert t == TemplateParser.OUTER_TOKEN_EXPRESS
+                (operator, expression, identifier) = self._parse_inner(content, line, row)
+                if operator == "for":
+                    node = TemplateForNode(back, identifier, expression)
+                    root.append(node) if back is None else back.nodes.append(node)
+                    nodes.append(node)
+                elif operator == "if":
+                    node = TemplateIfNode(back, expression)
+                    root.append(node) if back is None else back.nodes.append(node)
+                    nodes.append(node)
+                elif operator == "else":
+                    if not isinstance(back, TemplateIfNode):
+                        raise ParseError("Unexpected else branch", line, row)
+                    node = TemplateIfElseNode(back.parent, back)
+                    # 从root或者父节点中删除back
+                    if back.parent is None:
+                        assert root[len(root) - 1] == back
+                        root.pop()
+                        root.append(node)
+                    else:
+                        parent_nodes = back.parent.nodes
+                        assert parent_nodes[len(parent_nodes) - 1] == back
+                        parent_nodes.pop()
+                        parent_nodes.append(node)
+                    # 升级并取代
+                    nodes.pop()
+                    nodes.append(node)
+                elif operator == "elif":
+                    if not isinstance(back, TemplateIfNode):
+                        raise ParseError("Unexpected elif branch", line, row)
+                    closed_else = TemplateIfElseNode(back.parent, back)
+                    # 从root或者父节点中删除back
+                    if back.parent is None:
+                        assert root[len(root) - 1] == back
+                        root.pop()
+                        root.append(closed_else)
+                    else:
+                        parent_nodes = back.parent.nodes
+                        assert parent_nodes[len(parent_nodes) - 1] == back
+                        parent_nodes.pop()
+                        parent_nodes.append(closed_else)
+                    node = TemplateIfNode(closed_else, expression)
+                    closed_else.nodes.append(node)
+                    # 取代
+                    nodes.pop()
+                    nodes.append(node)
+                elif operator == "end":
+                    if back is None:
+                        raise ParseError("Unexpected block end", line, row)
+                    nodes.pop()  # 完成一个节点
+                else:
+                    assert operator == ""
+                    node = TemplateExpressionNode(back, expression)
+                    root.append(node) if back is None else back.nodes.append(node)
+        if len(nodes) != 0:
+            raise ParseError("Unclosed block", self._consumer.get_line(), self._consumer.get_row())
+        return root
+
+
+def render_template(template, **context):
+    p = TemplateParser(template)
+    root = p.process()
+    output = []
+    stack = [iter(root)]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            output.append(node)
+        elif isinstance(node, TemplateExpressionNode):
+            output.append(str(node.render(context)))
+        elif isinstance(node, TemplateNode):
+            stack.append(node.render(context))
+        else:
+            new_node = next(node, None)
+            if new_node is not None:
+                stack.append(node)
+                stack.append(new_node)
+    return "".join(output)
+
+
+# ---------------------------------------- 代码生成 ----------------------------------------
+
+
+def generate_code(header_template: str, source_template: str, analyzer: GrammarAnalyzer, header_filename: str):
+    # 对所有符号进行整理，下标即最终的符号ID
+    symbols = [kEofSymbol]
+    tmp = list(analyzer.document().terminals())
+    tmp.sort(key=lambda s: s.id())
+    symbols.extend(tmp)
+    token_cnt = len(symbols)
+    tmp = list(analyzer.document().non_terminals())
+    tmp.sort(key=lambda s: s.id())
+    symbols.extend(tmp)
+
+    # 生成token信息
+    token_info = []
+    for i in range(0, token_cnt):
+        assert symbols[i].type() == SYMBOL_TERMINAL or symbols[i].type() == SYMBOL_EOF
+        token_info.append({
+            "id": i,
+            "c_name": "_" if symbols[i] == kEofSymbol else symbols[i].id(),
+            "raw": symbols[i]
+        })
+
+    # 生成映射表
+    symbol_mapping = {}
+    for i in range(0, len(symbols)):
+        s = symbols[i]
+        symbol_mapping[s] = i
+
+    # 生成产生式信息
+    production_info = []
+    for i in range(0, len(analyzer.document().productions())):
+        p = analyzer.document().productions()[i]
+        assert i == p.index()
+        production_info.append({
+            "symbol": symbol_mapping[p.left()],
+            "count": len(p),
+            "raw": p
+        })
+
+    # 生成动作表
+    actions = []
+    state_remap_id_to_state_id = {}
+    state_id_to_state_remap_id = {}
+    offset = 0
+    state_cnt = 0
+    for i in range(0, analyzer.max_state() + 1):
+        empty_state = True
+        if i in analyzer.actions()[kEofSymbol]:
+            empty_state = False
+        else:
+            for s in analyzer.document().symbols():
+                if i in analyzer.actions()[s]:
+                    empty_state = False
+                    break
+        if empty_state:
+            offset += 1
+        else:
+            assert i not in state_id_to_state_remap_id
+            assert (i - offset) not in state_remap_id_to_state_id
+            state_id_to_state_remap_id[i] = i - offset
+            state_remap_id_to_state_id[i - offset] = i
+            state_cnt += 1
+    for i in range(0, state_cnt):
+        action = []
+        for j in range(0, len(symbols)):
+            s = symbols[j]
+            one_action = [0, 0]
+            state = state_remap_id_to_state_id[i]
+            if state in analyzer.actions()[s]:
+                act = analyzer.actions()[s][state]
+                one_action[0] = act.action()
+                if one_action == ACTION_GOTO:
+                    one_action[1] = state_id_to_state_remap_id[act.arg().state()]
+                elif one_action == ACTION_REDUCE:
+                    assert analyzer.document().productions()[act.arg().index()] == act.arg()
+                    one_action[1] = act.arg().index()
+            action.append(one_action)
+        actions.append(action)
+
+    # 生成C++类型
+    token_types = []
+    need_monostate = False
+    for s in analyzer.document().terminals():
+        if s.replace() is None:
+            need_monostate = True
+        else:
+            assert s.replace().strip() == s.replace()
+            assert s.replace() != "std::monostate"
+            if s.replace() not in token_types:
+                token_types.append(s.replace())
+    token_types.sort()
+    if need_monostate or len(token_types) == 0:
+        token_types.insert(0, "std::monostate")
+    production_types = []
+    need_monostate = False
+    for s in analyzer.document().non_terminals():
+        if s.replace() is None:
+            need_monostate = True
+        else:
+            assert s.replace().strip() == s.replace()
+            assert s.replace() != "std::monostate"
+            if s.replace() not in production_types:
+                production_types.append(s.replace())
+    production_types.sort()
+    if need_monostate or len(production_types) == 0:
+        production_types.insert(0, "std::monostate")
+
+    # generate the context
+    args = analyzer.document().generator_args() or {}
+    context = {
+        "namespace": args.get("namespace", None),
+        "class_name": args.get("class_name", "Parser"),
+        "includes": args.get("includes", []),
+        "symbols": symbols,
+        "token_info": token_info,
+        "token_types": token_types,
+        "production_info": production_info,
+        "production_types": production_types,
+        "actions": actions,
+        "header_filename": header_filename,
+    }
+
+    header_src = render_template(header_template, **context)
+    source_src = render_template(source_template, **context)
+    return header_src, source_src
+
+# ---------------------------------------- Main ----------------------------------------
+
+
+CPP_HEADER_TPL = """/**
+ * @file
+ * @date {% datetime.date.today() %}
+ *
+ * Auto generated code by 9chu/parser_gen.
+ */
+#pragma once
+#include <cstdint>
+#include <vector>
+#include <variant>
+
+{% for f in includes %}
+#include "{% f %}"
+{% end %}
+
+{% if namespace is None %}
+// namespace {
+{% else %}
+namespace {% namespace %}
+{
+{% end %}
+    class {% class_name %}
+    {
+    public:
+        enum class ParseResult
+        {
+            NotKnown = 0,
+            Accepted = 1,
+            Rejected = 2,
+        };
+        
+        enum class Tokens
+        {
+            {% for t in token_info %}
+            {% t["c_name"] %} = {% t["id"] %},
+            {% end %}
+        };
+        
+        using TokenValues = std::variant<
+            {% for i in range(0, len(token_types)) %}
+            {% token_types[i] %}{% if i != len(token_types) - 1 %},{% end %}
+            {% end %}
+            >;
+            
+        using ProductionValues = std::variant<
+            {% for i in range(0, len(production_types)) %}
+            {% production_types[i] %}{% if i != len(production_types) - 1 %},{% end %}
+            {% end %}
+            >;
+        
+        using UnionValues = std::variant<TokenValues, ProductionValues>;
+        
+    public:
+        {% class_name %}();
+        
+    public:
+        ParseResult operator()(Tokens token, const TokenValues& value);
+        void Reset()noexcept;
+        
+    private:
+        std::vector<uint32_t> m_stStack;
+        std::vector<UnionValues> m_stValueStack;
+    };
+{% if namespace is None %}
+// }
+{% else %}
+}
+{% end %}
+"""
+
+CPP_SOURCE_TPL = """/**
+ * @file
+ * @date {% datetime.date.today() %}
+ *
+ * Auto generated code by 9chu/parser_gen.
+ */
+#include "{% header_filename %}"
+
+#include <cassert>
+
+{% if namespace is not None %}
+using namespace {% namespace %};
+{% end %}
+
+#define ACTION_ERROR 0
+#define ACTION_ACCEPT 1
+#define ACTION_GOTO 2
+#define ACTION_REDUCE 3
+
+namespace {
+    {% for idx in range(0, len(production_info)) %}
+    {% class_name %}::ProductionValues Reduce{% idx %}(const std::vector<{% class_name %}::UnionValues>& stack_)
+    {
+        // binding values
+        assert(stack_.size() >= {% len(production_info[idx]["raw"]) %});
+        {% for pos in production_info[idx]["raw"].binding() %}
+        const auto& {% production_info[idx]["raw"].binding()[pos] %} =
+        {% if production_info[idx]["raw"][pos].type() == 2 %}
+            std::get<{% production_info[idx]["raw"][pos].replace() %}>(
+                std::get<{% class_name %}::ProductionValues>(stack_[stack_.size() - {% len(production_info[idx]["raw"]) + pos %}]));
+        {% else %}
+            std::get<{% production_info[idx]["raw"][pos].replace() %}>(
+                std::get<{% class_name %}::TokenValues>(stack_[stack_.size() - {% len(production_info[idx]["raw"]) + pos %}]));{% end %}
+        {% end %}
+        
+        // user code
+        {% if production_info[idx]["raw"].left().replace() is not None %}
+        auto ret = [&]() {
+            {% production_info[idx]["raw"].replace().strip() %}
+        }();
+        return {% class_name %}::ProductionValues { std::move(ret) };
+        {% else %}
+        {% production_info[idx]["raw"].replace() %}
+        return {% class_name %}::ProductionValues {};
+        {% end %}
+    }
+    
+    {% end %}
+}
+
+using ReduceFunction = {% class_name %}::ProductionValues(*)(const std::vector<{% class_name %}::UnionValues>&);
+
+struct ProductionInfo
+{
+    uint32_t NonTerminal;
+    uint32_t SymbolCount;
+    ReduceFunction Callback;
+};
+
+struct ActionInfo
+{
+    uint8_t Action;
+    uint32_t Arg;
+};
+
+static const ProductionInfo kProductions[{% len(production_info) %}] = {
+    {% for i in range(0, len(production_info)) %}
+    { {% production_info[i]["symbol"] %}, {% production_info[i]["count"] %}, ::Reduce{% i %} },
+    {% end %}
+};
+
+static const ActionInfo kActions[{% len(actions) %}][{% len(symbols) %}] = {
+    {% for action in actions %}
+    { {% for act in action %}{ {% act[0] %}, {% act[1] %} },{% end %} },
+    {% end %}
+};
+
+{% class_name %}::{% class_name %}()
+{
+    Reset();
+}
+
+{% class_name %}::ParseResult {% class_name %}::operator()(Tokens token, const TokenValues& value)
+{
+    assert(!m_stStack.empty());
+    assert(static_cast<uint32_t>(token) < {% len(token_info) %});
+    
+    const ActionInfo& act = kActions[m_stStack.back()][static_cast<uint32_t>(token)];
+    if (act.Action == ACTION_ACCEPT)
+    {
+        Reset();
+        return ParseResult::Accepted;
+    }
+    else if (act.Action == ACTION_ERROR)
+    {
+        Reset();
+        return ParseResult::Rejected;
+    }
+    else if (act.Action == ACTION_GOTO)
+    {
+        m_stStack.push_back(static_cast<uint32_t>(token));
+        m_stStack.push_back(act.Arg);
+        assert(m_stStack.back() < {% len(actions) %});
+        
+        m_stValueStack.push_back(value);
+    }
+    else
+    {
+        assert(act.Action == ACTION_REDUCE);
+        assert(act.Arg < {% len(production_info) %});
+        
+        const ProductionInfo& info = kProductions[act.Arg];
+        auto val = info.Callback(m_stValueStack);
+        
+        assert(m_stStack.size() >= info.SymbolCount * 2);
+        m_stStack.resize(m_stStack.size() - info.SymbolCount * 2);
+        
+        assert(m_stValueStack.size() >= info.SymbolCount);
+        m_stValueStack.resize(m_stValueStack.size() - info.SymbolCount);
+        
+        m_stValueStack.emplace_back(std::move(val));
+        assert(!m_stStack.empty());
+        
+        const ActionInfo& act2 = kActions[m_stStack.back()][info.NonTerminal];
+        if (act2.Action == ACTION_GOTO)
+        {
+            m_stStack.push_back(info.NonTerminal);
+            m_stStack.push_back(act2.Arg);
+        }
+        else
+        {
+            assert(false);
+            Reset();
+            return ParseResult::Rejected;
+        }
+    }
+    
+    return ParseResult::NotKnown;
+}
+
+void {% class_name %}::Reset()noexcept
+{
+    m_stStack.clear();
+    m_stValueStack.clear();
+    
+    // initial state
+    m_stStack.push_back(0);
+}
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser(description="A LR(1)/LALR(1) parser generator for C++17.")
+    parser.add_argument("--header-file", type=str, help="Output header filename", default="Parser.hpp")
+    parser.add_argument("--source-file", type=str, help="Output source filename", default="Parser.cpp")
+    parser.add_argument("-o", "--output-dir", type=str, help="Output directory", default="./")
+    parser.add_argument("--header-template", type=str, help="User defined header template", default="")
+    parser.add_argument("--source-template", type=str, help="User defined source template", default="")
+    parser.add_argument("--lalr", type=bool, help="Set to LALR(1) mode", default=False)
+    parser.add_argument("--print-actions", type=bool, help="Print action table", default=False)
+    parser.add_argument("grammar-filename", help="Grammar filename")
+    args = parser.parse_args()
+
+    doc = GrammarDocument()
+    doc.parse(args.grammar_filename)
+
+    analyzer = GrammarAnalyzer(doc)
+    analyzer.process(GRAMMAR_MODE_LALR if args.lalr else GRAMMAR_MODE_LR1)
+
+    if args.print_actions:
+        print(analyzer.printable_actions())
+
+    resolve_rr_cnt, resolve_sr_by_prec_cnt, resolve_sr_by_shift_cnt = analyzer.resolve_stat()
+    sys.stderr.write(f"Reduce/Reduce conflict resolved count: {resolve_rr_cnt}\n")
+    sys.stderr.write(f"Shift/Reduce conflict resolved count (by Operator Precedence): {resolve_sr_by_prec_cnt}\n")
+    sys.stderr.write(f"Shift/Reduce conflict resolved count (by Shift Priority): {resolve_sr_by_shift_cnt}\n")
+
+    header_tpl_content = CPP_HEADER_TPL
+    source_tpl_content = CPP_SOURCE_TPL
+    if args.header_template != "":
+        with open(args.header_template, "r", encoding="utf-8") as f:
+            header_tpl_content = f.read()
+    if args.source_template != "":
+        with open(args.source_template, "r", encoding="utf-8") as f:
+            source_tpl_content = f.read()
+    header_output, source_output = generate_code(header_tpl_content, source_tpl_content, analyzer, args.header_file)
+    with open(os.path.join(args.output_dir, args.header_file), "w", encoding="utf-8") as f:
+        f.write(header_output)
+    with open(os.path.join(args.output_dir, args.source_file), "w", encoding="utf-8") as f:
+        f.write(source_output)
+
 
 if __name__ == "__main__":
-    doc = GrammarDocument()
-    doc.parse("sample.txt")
-    print(doc.productions())
-    print(doc.terminals())
-    print(doc.non_terminals())
-    analyzer = GrammarAnalyzer(doc)
-    analyzer.process(GRAMMAR_MODE_LR1)
-    print(analyzer.printable_actions())
-    resolve_rr_cnt, resolve_sr_by_prec_cnt, resolve_sr_by_shift_cnt = analyzer.resolve_stat()
-    print(f"Resolve RR: {resolve_rr_cnt}, Resolve SR: {resolve_sr_by_prec_cnt} / {resolve_sr_by_shift_cnt}")
+    main()

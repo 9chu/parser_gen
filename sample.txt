@@ -1,43 +1,51 @@
-term plus assoc(left) prec(1);  // +
-term minus assoc(left) prec(1);  // -
-term mul assoc(left) prec(2);  // *
-term div assoc(left) prec(2);  // /
-term lp;  // (
-term rp;  // )
-term id {% Tokenizer::Token %};
-term number {% Tokenizer::Token %};
+term Plus assoc(left) prec(1);  // +
+term Minus assoc(left) prec(1);  // -
+term Multiply assoc(left) prec(2);  // *
+term Division assoc(left) prec(2);  // /
+term LeftParen;  // (
+term RightParen;  // )
+term Identifier {% Tokenizer::Token %};
+term LiteralNumber {% Tokenizer::Token %};
 
-nonterm Expression {% Ast::ExpressionPtr %};
+nonterm exp {% Ast::ExpressionPtr %};
 
 grammar {
     // entry rules
-    Expression -> id(token) {%
+    exp -> Identifier(token) {%
         auto rvalue = std::make_shared<Ast::RValueRef>(std::get<std::string>(token));
         return std::static_pointer_cast<Ast::Expression>(rvalue);
     %};
-    Expression -> number(token) {%
+    exp -> LiteralNumber(token) {%
         auto number = std::make_shared<Ast::NumberLiteral>(std::get<double>(token));
         return std::static_pointer_cast<Ast::Expression>(number);
     %};
-    Expression -> lp Expression(exp) rp {% return exp; %};
-    Expression -> minus Expression(rhs) prec(10) {%
-        auto unary = std::make_shared<Ast::UnaryExpression>(rhs, Ast::UnaryOp::Minus);
+    exp -> LeftParen exp(exp) RightParen {% return exp; %};
+    exp -> Minus exp(rhs) prec(10) {%
+        auto unary = std::make_shared<Ast::UnaryExpression>(rhs, Ast::UnaryOp::Negative);
         return std::static_pointer_cast<Ast::Expression>(unary);
     %};
-    Expression -> Expression(lhs) plus Expression(rhs) {%
+    exp -> exp(lhs) Plus exp(rhs) {%
         auto binexp = std::make_shared<Ast::BinaryExpression>(lhs, rhs, Ast::BinaryOp::Plus);
         return std::static_pointer_cast<Ast::Expression>(binexp);
     %};
-    Expression -> Expression(lhs) minus Expression(rhs) {%
+    exp -> exp(lhs) Minus exp(rhs) {%
         auto binexp = std::make_shared<Ast::BinaryExpression>(lhs, rhs, Ast::BinaryOp::Minus);
         return std::static_pointer_cast<Ast::Expression>(binexp);
     %};
-    Expression -> Expression(lhs) mul Expression(rhs) {%
+    exp -> exp(lhs) Multiply exp(rhs) {%
         auto binexp = std::make_shared<Ast::BinaryExpression>(lhs, rhs, Ast::BinaryOp::Multiply);
         return std::static_pointer_cast<Ast::Expression>(binexp);
     %};
-    Expression -> Expression(lhs) div Expression(rhs) {%
+    exp -> exp(lhs) Division exp(rhs) {%
         auto binexp = std::make_shared<Ast::BinaryExpression>(lhs, rhs, Ast::BinaryOp::Division);
         return std::static_pointer_cast<Ast::Expression>(binexp);
     %};
 };
+
+generator {%
+    {
+        "includes": [
+            "Test.hpp"
+        ]
+    }
+%};

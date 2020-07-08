@@ -1,10 +1,24 @@
 #!python3
 # -*- coding: utf-8 -*-
+#
 # parser_gen
 #   一个 LR(1)/LALR 语法解析器生成工具。
-# Author: chu
-# Email: 1871361697@qq.com
-# License: MIT License
+#
+# Copyright (C) 2020 Chen Chu<1871361697@qq.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+# persons to whom the Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+# Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+# OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
 import os
 import sys
 import json
@@ -1862,9 +1876,9 @@ def generate_code(header_template: str, source_template: str, analyzer: GrammarA
             if state in analyzer.actions()[s]:
                 act = analyzer.actions()[s][state]
                 one_action[0] = act.action()
-                if one_action == ACTION_GOTO:
+                if act.action() == ACTION_GOTO:
                     one_action[1] = state_id_to_state_remap_id[act.arg().state()]
-                elif one_action == ACTION_REDUCE:
+                elif act.action() == ACTION_REDUCE:
                     assert analyzer.document().productions()[act.arg().index()] == act.arg()
                     one_action[1] = act.arg().index()
             action.append(one_action)
@@ -1951,7 +1965,7 @@ namespace {% namespace %}
             Rejected = 2,
         };
         
-        enum class Tokens
+        enum class TokenTypes
         {
             {% for t in token_info %}
             {% t["c_name"] %} = {% t["id"] %},
@@ -1976,12 +1990,20 @@ namespace {% namespace %}
         {% class_name %}();
         
     public:
-        ParseResult operator()(Tokens token, const TokenValues& value);
+        ParseResult operator()(TokenTypes token, const TokenValues& value);
         void Reset()noexcept;
+        
+        {% if production_info[0]["raw"].left().replace() is not None %}
+        const {% production_info[0]["raw"].left().replace() %}& Result()noexcept { return m_stResult; }
+        {% end %}
         
     private:
         std::vector<uint32_t> m_stStack;
         std::vector<UnionValues> m_stValueStack;
+        
+        {% if production_info[0]["raw"].left().replace() is not None %}
+        {% production_info[0]["raw"].left().replace() %} m_stResult;
+        {% end %}
     };
 {% if namespace is None %}
 // }
@@ -2011,18 +2033,24 @@ using namespace {% namespace %};
 
 namespace {
     {% for idx in range(0, len(production_info)) %}
-    {% class_name %}::ProductionValues Reduce{% idx %}(const std::vector<{% class_name %}::UnionValues>& stack_)
+    {% class_name %}::ProductionValues Reduce{% idx %}(std::vector<{% class_name %}::UnionValues>& stack_)
     {
         // binding values
         assert(stack_.size() >= {% len(production_info[idx]["raw"]) %});
         {% for pos in production_info[idx]["raw"].binding() %}
-        const auto& {% production_info[idx]["raw"].binding()[pos] %} =
+        auto {% production_info[idx]["raw"].binding()[pos] %} =
         {% if production_info[idx]["raw"][pos].type() == 2 %}
-            std::get<{% production_info[idx]["raw"][pos].replace() %}>(
-                std::get<{% class_name %}::ProductionValues>(stack_[stack_.size() - {% len(production_info[idx]["raw"]) + pos %}]));
+            std::move(std::get<{% production_info[idx]["raw"][pos].replace() %}>(
+                std::get<{% class_name %}::ProductionValues>(
+                    std::move(stack_[stack_.size() - {% len(production_info[idx]["raw"]) - pos %}])
+                )
+            ));
         {% else %}
-            std::get<{% production_info[idx]["raw"][pos].replace() %}>(
-                std::get<{% class_name %}::TokenValues>(stack_[stack_.size() - {% len(production_info[idx]["raw"]) + pos %}]));{% end %}
+            std::move(std::get<{% production_info[idx]["raw"][pos].replace() %}>(
+                std::get<{% class_name %}::TokenValues>(
+                    std::move(stack_[stack_.size() - {% len(production_info[idx]["raw"]) - pos %}])
+                )
+            ));{% end %}
         {% end %}
         
         // user code
@@ -2032,7 +2060,9 @@ namespace {
         }();
         return {% class_name %}::ProductionValues { std::move(ret) };
         {% else %}
+        {% if production_info[idx]["raw"].replace() is not None %}
         {% production_info[idx]["raw"].replace() %}
+        {% end %}
         return {% class_name %}::ProductionValues {};
         {% end %}
     }
@@ -2040,7 +2070,7 @@ namespace {
     {% end %}
 }
 
-using ReduceFunction = {% class_name %}::ProductionValues(*)(const std::vector<{% class_name %}::UnionValues>&);
+using ReduceFunction = {% class_name %}::ProductionValues(*)(std::vector<{% class_name %}::UnionValues>&);
 
 struct ProductionInfo
 {
@@ -2072,59 +2102,74 @@ static const ActionInfo kActions[{% len(actions) %}][{% len(symbols) %}] = {
     Reset();
 }
 
-{% class_name %}::ParseResult {% class_name %}::operator()(Tokens token, const TokenValues& value)
+{% class_name %}::ParseResult {% class_name %}::operator()(TokenTypes token, const TokenValues& value)
 {
-    assert(!m_stStack.empty());
-    assert(static_cast<uint32_t>(token) < {% len(token_info) %});
-    
-    const ActionInfo& act = kActions[m_stStack.back()][static_cast<uint32_t>(token)];
-    if (act.Action == ACTION_ACCEPT)
+    while (true)
     {
-        Reset();
-        return ParseResult::Accepted;
-    }
-    else if (act.Action == ACTION_ERROR)
-    {
-        Reset();
-        return ParseResult::Rejected;
-    }
-    else if (act.Action == ACTION_GOTO)
-    {
-        m_stStack.push_back(static_cast<uint32_t>(token));
-        m_stStack.push_back(act.Arg);
-        assert(m_stStack.back() < {% len(actions) %});
-        
-        m_stValueStack.push_back(value);
-    }
-    else
-    {
-        assert(act.Action == ACTION_REDUCE);
-        assert(act.Arg < {% len(production_info) %});
-        
-        const ProductionInfo& info = kProductions[act.Arg];
-        auto val = info.Callback(m_stValueStack);
-        
-        assert(m_stStack.size() >= info.SymbolCount * 2);
-        m_stStack.resize(m_stStack.size() - info.SymbolCount * 2);
-        
-        assert(m_stValueStack.size() >= info.SymbolCount);
-        m_stValueStack.resize(m_stValueStack.size() - info.SymbolCount);
-        
-        m_stValueStack.emplace_back(std::move(val));
         assert(!m_stStack.empty());
+        assert(static_cast<uint32_t>(token) < {% len(token_info) %});
         
-        const ActionInfo& act2 = kActions[m_stStack.back()][info.NonTerminal];
-        if (act2.Action == ACTION_GOTO)
+        const ActionInfo& act = kActions[m_stStack.back()][static_cast<uint32_t>(token)];
+        if (act.Action == ACTION_ACCEPT)
         {
-            m_stStack.push_back(info.NonTerminal);
-            m_stStack.push_back(act2.Arg);
+            {% if production_info[0]["raw"].left().replace() is not None %}
+            // store the result
+            assert(!m_stValueStack.empty());
+            m_stResult =
+                std::move(std::get<{% production_info[0]["raw"].left().replace() %}>(
+                    std::get<ProductionValues>(std::move(m_stValueStack.back()))
+                ));
+            {% end %}
+    
+            Reset();
+            return ParseResult::Accepted;
         }
-        else
+        else if (act.Action == ACTION_ERROR)
         {
-            assert(false);
             Reset();
             return ParseResult::Rejected;
         }
+        else if (act.Action == ACTION_GOTO)
+        {
+            m_stStack.push_back(static_cast<uint32_t>(token));
+            m_stStack.push_back(act.Arg);
+            assert(m_stStack.back() < {% len(actions) %});
+            
+            m_stValueStack.push_back(value);
+        }
+        else
+        {
+            assert(act.Action == ACTION_REDUCE);
+            assert(act.Arg < {% len(production_info) %});
+            
+            const ProductionInfo& info = kProductions[act.Arg];
+            auto val = info.Callback(m_stValueStack);
+            
+            assert(m_stStack.size() >= info.SymbolCount * 2);
+            m_stStack.resize(m_stStack.size() - info.SymbolCount * 2);
+            
+            assert(m_stValueStack.size() >= info.SymbolCount);
+            m_stValueStack.resize(m_stValueStack.size() - info.SymbolCount);
+            
+            m_stValueStack.emplace_back(std::move(val));
+            assert(!m_stStack.empty());
+            
+            const ActionInfo& act2 = kActions[m_stStack.back()][info.NonTerminal];
+            if (act2.Action == ACTION_GOTO)
+            {
+                m_stStack.push_back(info.NonTerminal);
+                m_stStack.push_back(act2.Arg);
+            }
+            else
+            {
+                assert(false);
+                Reset();
+                return ParseResult::Rejected;
+            }
+            
+            continue;
+        }
+        break;
     }
     
     return ParseResult::NotKnown;
@@ -2148,13 +2193,13 @@ def main():
     parser.add_argument("-o", "--output-dir", type=str, help="Output directory", default="./")
     parser.add_argument("--header-template", type=str, help="User defined header template", default="")
     parser.add_argument("--source-template", type=str, help="User defined source template", default="")
-    parser.add_argument("--lalr", type=bool, help="Set to LALR(1) mode", default=False)
-    parser.add_argument("--print-actions", type=bool, help="Print action table", default=False)
-    parser.add_argument("grammar-filename", help="Grammar filename")
+    parser.add_argument("--lalr", action="store_true", help="Set to LALR(1) mode", default=False)
+    parser.add_argument("--print-actions", action="store_true", help="Print action table", default=False)
+    parser.add_argument("grammar", help="Grammar filename")
     args = parser.parse_args()
 
     doc = GrammarDocument()
-    doc.parse(args.grammar_filename)
+    doc.parse(args.grammar)
 
     analyzer = GrammarAnalyzer(doc)
     analyzer.process(GRAMMAR_MODE_LALR if args.lalr else GRAMMAR_MODE_LR1)
